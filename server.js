@@ -22,6 +22,9 @@ if (process.env.NODE_ENV === "development") {
 }
 
 // Import Route Files
+app.get("/", (req, res) => {
+  res.send("Backend is running successfully!");
+});
 app.use("/api/auth", require("./routes/authRoutes"));
 app.use("/api/users", require("./routes/userRoutes"));
 app.use("/api/transactions", require("./routes/transactionRoutes"));
