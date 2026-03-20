@@ -28,10 +28,9 @@ const accountSchema = new mongoose.Schema(
       uppercase: true,
       default: "USD",
     },
-    // We put this back so your transfer controller still works!
     transactionPin: {
       type: String,
-      required: false, // Optional during registration, set later
+      required: false,
     },
     isActive: {
       type: Boolean,
@@ -41,28 +40,25 @@ const accountSchema = new mongoose.Schema(
   { timestamps: true },
 );
 
-/**
- * Account-level Middleware
- * Hashes the transactionPin if it's being set or updated on this account
- */
+// Middleware to hash PIN before saving
 accountSchema.pre("save", async function () {
-  // Only proceed if transactionPin is modified and exists
-  if (!this.isModified("transactionPin") || !this.transactionPin) {
-    return;
-  }
+  if (!this.isModified("transactionPin") || !this.transactionPin) return;
 
   try {
-    const salt = (await bcrypt.env) ? parseInt(process.env.SALT_ROUNDS) : 10;
-    const generatedSalt = await bcrypt.genSalt(salt);
-    this.transactionPin = await bcrypt.hash(this.transactionPin, generatedSalt);
-    // No next() call
+    const salt = await bcrypt.genSalt(10);
+    this.transactionPin = await bcrypt.hash(this.transactionPin, salt);
   } catch (error) {
-    throw error; // Mongoose catches this promise rejection
+    throw new Error("Encryption failed");
   }
 });
 
-// Method to verify PIN during a transfer
+// Helper to verify PIN
 accountSchema.methods.compareTransactionPin = async function (enteredPin) {
+  if (!this.transactionPin) {
+    throw new Error(
+      "Transaction PIN not initialized. Please set one in settings.",
+    );
+  }
   return await bcrypt.compare(enteredPin, this.transactionPin);
 };
 
