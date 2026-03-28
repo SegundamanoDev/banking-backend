@@ -32,6 +32,17 @@ const accountSchema = new mongoose.Schema(
       type: String,
       required: false,
     },
+    activeLoan: {
+      principal: Number,
+      remainingBalance: Number,
+      interestRate: Number,
+      nextPaymentDate: Date,
+      status: {
+        type: String,
+        enum: ["pending", "active", "closed"],
+        default: "pending",
+      },
+    },
     isActive: {
       type: Boolean,
       default: true,

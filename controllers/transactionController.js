@@ -1,56 +1,93 @@
-const Notification = require("../models/Notification");
-const Transaction = require("../models/Transaction");
-const PDFDocument = require("pdfkit");
 const mongoose = require("mongoose");
 const Account = require("../models/Account");
+const Transaction = require("../models/Transaction");
+const Notification = require("../models/Notification");
 const User = require("../models/User");
-const sendEmail = require("../utils/sendEmail");
 
 exports.transferMoney = async (req, res) => {
-  const { recipientAccountNumber, amount, description, pin } = req.body;
+  const {
+    category,
+    recipientAccountNumber,
+    amount,
+    description,
+    pin,
+    swiftCode,
+    bankName,
+    recipientName,
+  } = req.body;
+
   const senderUserId = req.user._id;
 
-  if (!recipientAccountNumber || !amount || !pin) {
+  // 1. Basic Validation
+  if (!amount || amount <= 0)
     return res
       .status(400)
-      .json({ message: "Recipient, amount, and PIN are required" });
-  }
-
-  if (amount <= 0) {
-    return res
-      .status(400)
-      .json({ message: "Amount must be greater than zero" });
-  }
+      .json({ message: "Invalid transaction amount specified." });
+  if (!pin)
+    return res.status(400).json({
+      message: "Security authorization (PIN) is required to proceed.",
+    });
 
   const session = await mongoose.startSession();
   session.startTransaction();
 
   try {
+    // 2. Verify Sender Account
     const senderAccount = await Account.findOne({ user: senderUserId }).session(
       session,
     );
-    if (!senderAccount) throw new Error("Sender account not found");
+    if (!senderAccount)
+      throw new Error("Source account could not be identified.");
 
+    // 3. Verify PIN
     const isPinValid = await senderAccount.compareTransactionPin(pin);
-    if (!isPinValid) throw new Error("Invalid Security PIN");
+    if (!isPinValid)
+      throw new Error("Security checksum mismatch. Invalid Authorization PIN.");
 
-    if (senderAccount.balance < amount) throw new Error("Insufficient funds");
+    // 4. Check Liquidity
+    if (senderAccount.balance < amount)
+      throw new Error("Transaction declined: Insufficient account liquidity.");
 
-    const receiverAccount = await Account.findOne({
-      accountNumber: recipientAccountNumber,
-    }).session(session);
-    if (!receiverAccount) throw new Error("Recipient account not found");
+    let receiverUserId = null;
+    let transactionStatus = "completed";
 
-    if (senderAccount.accountNumber === recipientAccountNumber) {
-      throw new Error("Cannot transfer to the same account");
+    // --- LOGIC BRANCHING ---
+    if (category === "local") {
+      const receiverAccount = await Account.findOne({
+        accountNumber: recipientAccountNumber,
+      }).session(session);
+
+      if (!receiverAccount)
+        throw new Error(
+          "Recipient account validation failed. Beneficiary not found within our records.",
+        );
+
+      if (receiverAccount.accountNumber === senderAccount.accountNumber)
+        throw new Error(
+          "Instruction declined: Source and destination accounts cannot be identical.",
+        );
+
+      // Credit internal receiver
+      receiverAccount.balance += Number(amount);
+      await receiverAccount.save({ session });
+      receiverUserId = receiverAccount.user;
+    } else if (category === "international") {
+      if (!swiftCode || !bankName)
+        throw new Error(
+          "Missing Wire Requirements: SWIFT/BIC and Bank Name are mandatory for cross-border settlement.",
+        );
+
+      // International transfers move to 'pending' for Treasury Audit
+      transactionStatus = "pending";
+    } else {
+      throw new Error("Unsupported transaction category.");
     }
 
+    // 5. Deduct Sender Balance
     senderAccount.balance -= Number(amount);
-    receiverAccount.balance += Number(amount);
-
     await senderAccount.save({ session });
-    await receiverAccount.save({ session });
 
+    // 6. Generate Reference & Create Transaction record
     const transactionId = `UC-TXN-${Math.random().toString(36).toUpperCase().substring(2, 10)}`;
 
     const [transaction] = await Transaction.create(
@@ -58,156 +95,67 @@ exports.transferMoney = async (req, res) => {
         {
           transactionId,
           sender: senderUserId,
-          receiver: receiverAccount.user,
+          receiver: receiverUserId,
+          recipientAccountNumber,
+          recipientName:
+            recipientName ||
+            (category === "local"
+              ? "UC INTERNAL CLIENT"
+              : "EXTERNAL BENEFICIARY"),
+          recipientBankName:
+            category === "local" ? "United Capital Bank" : bankName,
+          swiftCode: swiftCode || "UCB-INT-CLR",
           amount,
           type: "transfer",
-          status: "completed",
-          description: description || "Institutional Transfer",
+          category,
+          status: transactionStatus,
+          description:
+            description || `Institutional ${category.toUpperCase()} Remittance`,
           reference: `REF-${Date.now()}`,
         },
       ],
-      { session, ordered: true },
+      { session },
     );
 
+    // 7. Create In-App Notification
     await Notification.create(
       [
         {
           user: senderUserId,
-          title: "Debit Notification",
-          message: `Debit: $${amount} to ACC: ${recipientAccountNumber}. Ref: ${transactionId}`,
+          title: "Debit Advice Notification",
+          message: `Your account has been debited $${amount.toLocaleString()} for a ${category} remittance to ${recipientAccountNumber}. Reference: ${transactionId}. Status: ${transactionStatus}.`,
           type: "debit",
         },
-        {
-          user: receiverAccount.user,
-          title: "Credit Notification",
-          message: `Credit: $${amount} from ACC: ${senderAccount.accountNumber}. Ref: ${transactionId}`,
-          type: "credit",
-        },
       ],
-      { session, ordered: true },
+      { session },
     );
 
     await session.commitTransaction();
     session.endSession();
 
-    // Background process: Email Advice
-    setImmediate(async () => {
-      try {
-        const receiverUser = await User.findById(receiverAccount.user);
-
-        // COMMON STYLES
-        const styles = `
-          font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
-          max-width: 600px;
-          margin: 0 auto;
-          background-color: #ffffff;
-          border: 1px solid #e2e8f0;
-          border-radius: 8px;
-          overflow: hidden;
-        `;
-
-        const header = `
-          <div style="background-color: #0f172a; padding: 30px; text-align: center;">
-            <h1 style="color: #10b981; font-style: italic; margin: 0; font-size: 24px; letter-spacing: 2px;">UNITED CAPITAL</h1>
-            <p style="color: #64748b; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; margin-top: 5px;">Institutional Private Wealth</p>
-          </div>
-        `;
-
-        const footer = `
-          <div style="background-color: #f8fafc; padding: 20px; text-align: center; border-top: 1px solid #e2e8f0;">
-            <p style="font-size: 12px; color: #94a3b8; margin: 0;">This is an automated security notification. Please do not reply.</p>
-            <p style="font-size: 10px; color: #cbd5e1; margin-top: 10px; text-transform: uppercase;">© 2026 United Capital Private Wealth Management.</p>
-          </div>
-        `;
-
-        // 1. DEBIT ADVICE (For the Sender)
-        await sendEmail({
-          email: req.user.email,
-          subject: "Debit Advice [Action Required]",
-          html: `
-            <div style="${styles}">
-              ${header}
-              <div style="padding: 40px 30px;">
-                <h2 style="font-size: 20px; font-weight: 800; color: #0f172a; margin-bottom: 20px; border-bottom: 2px solid #f1f5f9; padding-bottom: 10px;">Debit Advice</h2>
-                <p style="color: #475569; font-size: 14px; line-height: 1.6;">Dear ${req.user.firstName},</p>
-                <p style="color: #475569; font-size: 14px; line-height: 1.6;">Your account has been debited for the following transaction:</p>
-                
-                <table style="width: 100%; margin-top: 20px; border-collapse: collapse;">
-                  <tr>
-                    <td style="padding: 10px 0; color: #94a3b8; font-size: 12px; text-transform: uppercase;">Amount</td>
-                    <td style="padding: 10px 0; text-align: right; font-weight: bold; color: #ef4444;">$${Number(amount).toLocaleString()}</td>
-                  </tr>
-                  <tr>
-                    <td style="padding: 10px 0; color: #94a3b8; font-size: 12px; text-transform: uppercase;">Recipient</td>
-                    <td style="padding: 10px 0; text-align: right; font-weight: bold; color: #0f172a;">${recipientAccountNumber}</td>
-                  </tr>
-                  <tr>
-                    <td style="padding: 10px 0; color: #94a3b8; font-size: 12px; text-transform: uppercase;">Ref Number</td>
-                    <td style="padding: 10px 0; text-align: right; font-family: monospace; color: #475569;">${transactionId}</td>
-                  </tr>
-                  <tr>
-                    <td style="padding: 10px 0; color: #94a3b8; font-size: 12px; text-transform: uppercase; border-top: 1px solid #f1f5f9;">New Balance</td>
-                    <td style="padding: 10px 0; text-align: right; font-weight: 800; color: #0f172a; border-top: 1px solid #f1f5f9;">$${senderAccount.balance.toLocaleString()}</td>
-                  </tr>
-                </table>
-              </div>
-              ${footer}
-            </div>
-          `,
-        });
-
-        // 2. CREDIT ADVICE (For the Receiver)
-        if (receiverUser?.email) {
-          await sendEmail({
-            email: receiverUser.email,
-            subject: "Credit Advice [Inbound Capital]",
-            html: `
-              <div style="${styles}">
-                ${header}
-                <div style="padding: 40px 30px;">
-                  <h2 style="font-size: 20px; font-weight: 800; color: #0f172a; margin-bottom: 20px; border-bottom: 2px solid #f1f5f9; padding-bottom: 10px;">Credit Advice</h2>
-                  <p style="color: #475569; font-size: 14px; line-height: 1.6;">Dear ${receiverUser.firstName},</p>
-                  <p style="color: #475569; font-size: 14px; line-height: 1.6;">Your account was credited via an institutional wire transfer:</p>
-                  
-                  <table style="width: 100%; margin-top: 20px; border-collapse: collapse;">
-                    <tr>
-                      <td style="padding: 10px 0; color: #94a3b8; font-size: 12px; text-transform: uppercase;">Amount Received</td>
-                      <td style="padding: 10px 0; text-align: right; font-weight: bold; color: #10b981;">+$${Number(amount).toLocaleString()}</td>
-                    </tr>
-                    <tr>
-                      <td style="padding: 10px 0; color: #94a3b8; font-size: 12px; text-transform: uppercase;">Originator</td>
-                      <td style="padding: 10px 0; text-align: right; font-weight: bold; color: #0f172a;">${req.user.firstName} ${req.user.lastName}</td>
-                    </tr>
-                    <tr>
-                      <td style="padding: 10px 0; color: #94a3b8; font-size: 12px; text-transform: uppercase; border-top: 1px solid #f1f5f9;">New Balance</td>
-                      <td style="padding: 10px 0; text-align: right; font-weight: 800; color: #0f172a; border-top: 1px solid #f1f5f9;">$${receiverAccount.balance.toLocaleString()}</td>
-                    </tr>
-                  </table>
-                </div>
-                ${footer}
-              </div>
-            `,
-          });
-        }
-      } catch (err) {
-        console.error("Post-transaction email error:", err.message);
-      }
-    });
-
+    // 8. Final Institutional Response
     return res.status(200).json({
-      message: "Transfer successful",
+      success: true,
+      message:
+        category === "international"
+          ? "Wire instruction received. Transaction is currently awaiting Treasury clearance and SWIFT settlement."
+          : "Transaction successful. Funds have been remitted to the beneficiary account.",
       transactionId: transaction.transactionId,
-      newBalance: senderAccount.balance,
+      availableBalance: senderAccount.balance,
     });
   } catch (error) {
     await session.abortTransaction();
     session.endSession();
-    return res.status(400).json({ message: error.message });
+    // Return the specific error message as the reason for instruction failure
+    return res.status(400).json({
+      status: "Instruction Failed",
+      message:
+        error.message ||
+        "An unexpected error occurred during the settlement process.",
+    });
   }
 };
 
-// @desc    Get all transactions for the logged-in user
-// @route   GET /api/transactions/history
 exports.getTransactionHistory = async (req, res) => {
   try {
     const userId = req.user._id;
