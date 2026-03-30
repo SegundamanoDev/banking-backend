@@ -29,6 +29,7 @@ app.use("/api/auth", require("./routes/authRoutes"));
 app.use("/api/users", require("./routes/userRoutes"));
 app.use("/api/loans", require("./routes/loanRoutes"));
 app.use("/api/transactions", require("./routes/transactionRoutes"));
+app.use("/api/security", require("./routes/securityRoutes"));
 app.use("/api/admin", require("./routes/adminRoutes"));
 
 // Global Error Handler (Sweet UI trick: always return JSON errors)

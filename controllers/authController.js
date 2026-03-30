@@ -9,21 +9,22 @@ const generateToken = (id) => {
   return jwt.sign({ id }, process.env.JWT_SECRET, { expiresIn: "30d" });
 };
 
-// @desc    Register new user & create institutional account
-// @route   POST /api/auth/register
 exports.registerUser = async (req, res) => {
-  const { firstName, lastName, email, password, securityPin } = req.body;
+  const { firstName, lastName, email, password } = req.body;
 
-  if (!firstName || !lastName || !email || !password || !securityPin) {
-    return res
-      .status(400)
-      .json({ message: "All security fields are required." });
+  // 1. Precise Validation
+  if (!firstName || !lastName || !email || !password) {
+    return res.status(400).json({
+      success: false,
+      message: "All identification fields are required for KYC compliance.",
+    });
   }
 
   const session = await mongoose.startSession();
   session.startTransaction();
 
   try {
+    // 2. Check for existing profile within the session
     const userExists = await User.findOne({ email }).session(session);
     if (userExists) {
       throw new Error(
@@ -31,30 +32,17 @@ exports.registerUser = async (req, res) => {
       );
     }
 
-    // Generate unique 8-digit Login ID
+    // 3. Generate unique identifiers
     const customerId = "UC-" + Math.floor(10000000 + Math.random() * 90000000);
-
-    // 1. Create User Profile
-    const newUserArray = await User.create(
-      [
-        {
-          firstName,
-          lastName,
-          email,
-          password,
-          customerId,
-          securityPin, // Saved to User model
-        },
-      ],
-      { session },
-    );
-
-    const newUser = newUserArray[0];
-
-    // 2. Create Linked Bank Account
     const accountNumber = Math.floor(
       1000000000 + Math.random() * 9000000000,
     ).toString();
+
+    const newUserArray = await User.create(
+      [{ firstName, lastName, email, password, customerId }],
+      { session },
+    );
+    const newUser = newUserArray[0];
 
     await Account.create(
       [
@@ -62,8 +50,8 @@ exports.registerUser = async (req, res) => {
           user: newUser._id,
           accountNumber,
           balance: 0,
-          accountType: "savings",
-          transactionPin: securityPin, // Syncs PIN to Account model for transfers
+          isPinSet: false,
+          isActive: true,
         },
       ],
       { session },
@@ -72,49 +60,58 @@ exports.registerUser = async (req, res) => {
     await session.commitTransaction();
     session.endSession();
 
-    // 3. Post-Registration: Send Welcome Email
     setImmediate(async () => {
       try {
-        const emailTemplate = `
-          <div style="font-family: sans-serif; max-width: 600px; margin: auto; border: 1px solid #f1f5f9; border-radius: 20px; overflow: hidden;">
-            <div style="background-color: #0f172a; padding: 40px; text-align: center;">
-              <h1 style="color: #10b981; margin: 0; font-style: italic;">UNITED CAPITAL</h1>
+        const welcomeTemplate = `
+          <div style="font-family: 'Helvetica', sans-serif; max-width: 600px; margin: auto; border: 1px solid #e2e8f0; border-radius: 16px; overflow: hidden;">
+            <div style="background-color: #0f172a; padding: 30px; text-align: center;">
+              <h1 style="color: #10b981; margin: 0; font-style: italic; letter-spacing: 2px;">UNITED CAPITAL</h1>
             </div>
-            <div style="padding: 40px; color: #1e293b;">
-              <p>Dear ${firstName},</p>
-              <p>Your institutional profile is ready. Use the Digital ID below to access the vault.</p>
-              <div style="background-color: #f8fafc; padding: 20px; border-radius: 12px; text-align: center; border: 1px solid #e2e8f0;">
-                <small style="color: #64748b; text-transform: uppercase;">Digital ID (Login)</small>
-                <h2 style="color: #0f172a; margin: 10px 0;">${customerId}</h2>
+            <div style="padding: 40px; color: #1e293b; line-height: 1.6;">
+              <h2 style="color: #0f172a;">Welcome to the Private Vault, ${firstName}.</h2>
+              <p>Your institutional account has been successfully provisioned. To access your dashboard, use the Digital ID provided below:</p>
+              <div style="background-color: #f8fafc; padding: 20px; border-radius: 12px; text-align: center; border: 1px border-dashed #cbd5e1; margin: 25px 0;">
+                <span style="font-size: 10px; color: #64748b; font-weight: bold; text-transform: uppercase; tracking: 1px;">Institutional Login ID</span>
+                <h1 style="color: #0f172a; margin: 5px 0; letter-spacing: 3px;">${customerId}</h1>
               </div>
+              <p style="font-size: 12px; color: #64748b;"><b>Security Note:</b> Upon your first login, you will be required to initialize your 4-digit Transaction PIN in the Security Vault.</p>
+            </div>
+            <div style="background-color: #f1f5f9; padding: 20px; text-align: center; font-size: 10px; color: #94a3b8;">
+              &copy; 2026 United Capital Private Wealth Management. All rights reserved.
             </div>
           </div>
         `;
 
         await sendEmail({
           email: newUser.email,
-          subject: "Institutional Access Granted",
-          html: emailTemplate,
+          subject: "Institutional Access Granted - Action Required",
+          html: welcomeTemplate,
         });
       } catch (emailErr) {
-        console.error("Non-fatal email error:", emailErr.message);
+        console.error("Non-critical Email Failure:", emailErr.message);
       }
     });
 
     res.status(201).json({
-      firstName: newUser.firstName,
-      customerId: newUser.customerId,
+      success: true,
+      user: {
+        firstName: newUser.firstName,
+        lastName: newUser.lastName,
+        customerId: newUser.customerId,
+      },
       token: generateToken(newUser._id),
+      isPinSet: false,
     });
   } catch (error) {
     await session.abortTransaction();
     session.endSession();
-    res.status(400).json({ message: error.message || "Registration failed" });
+
+    res.status(400).json({
+      success: false,
+      message: error.message || "Registration protocol failed.",
+    });
   }
 };
-
-// @desc    Authenticate user & get token
-// @route   POST /api/auth/login
 exports.loginUser = async (req, res) => {
   const { customerId, password } = req.body;
 

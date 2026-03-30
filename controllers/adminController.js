@@ -158,24 +158,6 @@ exports.getAllUsers = async (req, res) => {
   }
 };
 
-// @desc    Approve or Block a user
-// @route   PATCH /api/admin/users/:id/status
-exports.updateUserStatus = async (req, res) => {
-  const { status } = req.body; // 'active' or 'blocked'
-
-  try {
-    const user = await User.findById(req.params.id);
-    if (!user) return res.status(404).json({ message: "User not found" });
-
-    user.status = status;
-    await user.save();
-
-    res.status(200).json({ message: `User status updated to ${status}`, user });
-  } catch (error) {
-    res.status(500).json({ message: error.message });
-  }
-};
-
 // @desc    Monitor ALL transactions in the system
 // @route   GET /api/admin/transactions
 exports.getAllTransactions = async (req, res) => {
@@ -343,13 +325,13 @@ exports.rejectLoan = async (req, res) => {
   }
 };
 
-// --- 3. REFINED APPROVE & DISBURSE LOAN ---
 exports.approveLoan = async (req, res) => {
   const { loanId } = req.params;
   const session = await mongoose.startSession();
   session.startTransaction();
 
   try {
+    // 1. Fetch Loan with Session
     const loan = await Loan.findOne({ _id: loanId, status: "pending" }).session(
       session,
     );
@@ -362,35 +344,41 @@ exports.approveLoan = async (req, res) => {
     if (!userAccount)
       throw new Error("Beneficiary account profile is missing.");
 
+    if (!userAccount.isActive) {
+      throw new Error(
+        "Disbursement Blocked: The recipient account is currently frozen/inactive.",
+      );
+    }
     // A. Update Loan record
     loan.status = "active";
     loan.startDate = new Date();
     await loan.save({ session });
 
-    // B. Update Account Balance AND set Active Loan Facility
-    // We calculate a 5% fixed interest for the "remainingBalance" display
+    // B. Update Account Balance AND Link Facility
     userAccount.balance += Number(loan.amount);
     userAccount.activeLoan = {
+      loanId: loan._id,
       principal: Number(loan.amount),
-      remainingBalance: Number(loan.amount) * 1.05,
-      interestRate: 5,
-      nextPaymentDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+      remainingBalance: Number(loan.totalToRepay),
+      interestRate: loan.interestRate,
+      nextPaymentDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000), // T+30 Days
       status: "active",
     };
+
+    // C. Save Account Changes
     await userAccount.save({ session });
 
-    // C. Create Ledger Entry for Audit
+    // D. Create Ledger Entry
     const txnId = `UC-LND-${Math.random().toString(36).toUpperCase().substring(2, 10)}`;
     await Transaction.create(
       [
         {
           transactionId: txnId,
-          sender: req.user._id, // Authorized by Admin
+          sender: req.user._id,
           receiver: loan.user,
           recipientAccountNumber: userAccount.accountNumber,
           amount: loan.amount,
           type: "loan_disbursement",
-          category: "internal",
           status: "completed",
           description: `Disbursement: ${loan.loanType} - Ref: ${loan.loanReference}`,
           reference: loan.loanReference,
@@ -399,13 +387,13 @@ exports.approveLoan = async (req, res) => {
       { session },
     );
 
-    // D. User Notification
+    // E. Notification
     await Notification.create(
       [
         {
           user: loan.user,
           title: "Capital Disbursement Notice",
-          message: `Credit Facility Approved. $${loan.amount.toLocaleString()} has been credited to your account.`,
+          message: `Credit Facility Approved. $${loan.amount.toLocaleString()} credited to ${userAccount.accountNumber}.`,
           type: "credit",
         },
       ],
@@ -413,10 +401,7 @@ exports.approveLoan = async (req, res) => {
     );
 
     await session.commitTransaction();
-    res.status(200).json({
-      success: true,
-      message: "Credit facility authorized. Funds disbursed.",
-    });
+    res.status(200).json({ success: true, message: "Funds disbursed." });
   } catch (error) {
     await session.abortTransaction();
     res.status(400).json({ message: error.message });
@@ -438,5 +423,66 @@ exports.getPendingWires = async (req, res) => {
   } catch (error) {
     console.error("Fetch Wires Error:", error);
     res.status(500).json({ message: "Failed to access Treasury Queue." });
+  }
+};
+
+exports.updateUserStatus = async (req, res) => {
+  const { status, freezeReason, restrictions } = req.body;
+  const { id: userId } = req.params;
+
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
+  try {
+    // 1. Update User Document (General Status)
+    const user = await User.findByIdAndUpdate(
+      userId,
+      { status: status || "active" },
+      { new: true, session },
+    );
+    if (!user) throw new Error("User profile not found");
+
+    // 2. Update Account Document (Granular Control)
+    const updateData = {
+      status: status || "active",
+      isActive: status === "active",
+    };
+
+    if (freezeReason) updateData.freezeReason = freezeReason;
+    if (restrictions) updateData.restrictions = restrictions;
+    if (status === "frozen") updateData.frozenAt = new Date();
+
+    const account = await Account.findOneAndUpdate(
+      { user: userId },
+      { $set: updateData },
+      { new: true, session },
+    );
+
+    // 3. Notify User of specific changes
+    await Notification.create(
+      [
+        {
+          user: userId,
+          title:
+            status === "active"
+              ? "Security Clearance Updated"
+              : "Account Restricted",
+          message:
+            status === "active"
+              ? "Your account restrictions have been lifted."
+              : `Administrative action taken: ${freezeReason || status}. Contact support.`,
+          type: status === "active" ? "system" : "alert",
+        },
+      ],
+      { session },
+    );
+
+    await session.commitTransaction();
+    res.status(200).json({ success: true, account });
+  } catch (error) {
+    await session.abortTransaction();
+    res.status(500).json({ message: error.message });
+  } finally {
+    session.endSession();
   }
 };

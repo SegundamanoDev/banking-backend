@@ -3,73 +3,72 @@ const bcrypt = require("bcryptjs");
 
 const accountSchema = new mongoose.Schema(
   {
-    user: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "User",
-      required: true,
-    },
-    accountNumber: {
+    user: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+    accountNumber: { type: String, unique: true, required: true },
+    balance: { type: Number, default: 0, min: 0 },
+
+    /* --- SECURITY & PIN --- */
+    transactionPin: { type: String },
+    isPinSet: { type: Boolean, default: false },
+    lastPinChange: { type: Date },
+    failedPinAttempts: { type: Number, default: 0 }, // Total lifetime fails
+    consecutiveFailedAttempts: { type: Number, default: 0 }, // Reset on success, triggers freeze at 3
+    resetPinToken: String,
+    resetPinExpires: Date,
+
+    /* --- ACCOUNT STATUS & RESTRICTIONS --- */
+    status: {
       type: String,
-      unique: true,
-      required: true,
+      enum: ["active", "frozen", "suspended", "restricted"],
+      default: "active",
     },
-    accountType: {
+    freezeReason: {
       type: String,
-      enum: ["savings", "checking", "corporate", "treasury"],
-      default: "savings",
+      enum: [
+        "suspicious_activity",
+        "failed_pin_attempts",
+        "administrative_hold",
+        "verification_required",
+        "none",
+      ],
+      default: "none",
     },
-    balance: {
-      type: Number,
-      default: 0,
-      min: [0, "Balance cannot be negative"],
+    frozenAt: { type: Date },
+    restrictions: {
+      canTransfer: { type: Boolean, default: true },
+      canRequestLoan: { type: Boolean, default: true },
+      canChangeSecurity: { type: Boolean, default: true },
     },
-    currency: {
-      type: String,
-      uppercase: true,
-      default: "USD",
-    },
-    transactionPin: {
-      type: String,
-      required: false,
-    },
+
+    /* --- LOAN MANAGEMENT --- */
     activeLoan: {
+      loanId: { type: mongoose.Schema.Types.ObjectId, ref: "Loan" },
       principal: Number,
-      remainingBalance: Number,
       interestRate: Number,
+      remainingBalance: Number,
       nextPaymentDate: Date,
       status: {
         type: String,
-        enum: ["pending", "active", "closed"],
-        default: "pending",
+        enum: ["none", "pending", "active"],
+        default: "none",
       },
     },
-    isActive: {
-      type: Boolean,
-      default: true,
-    },
+    isActive: { type: Boolean, default: true }, // General visibility flag
   },
   { timestamps: true },
 );
 
-// Middleware to hash PIN before saving
 accountSchema.pre("save", async function () {
-  if (!this.isModified("transactionPin") || !this.transactionPin) return;
+  if (!this.isModified("transactionPin")) return;
 
-  try {
-    const salt = await bcrypt.genSalt(10);
-    this.transactionPin = await bcrypt.hash(this.transactionPin, salt);
-  } catch (error) {
-    throw new Error("Encryption failed");
-  }
+  // 2. Hash the pin
+  const salt = await bcrypt.genSalt(10);
+  this.transactionPin = await bcrypt.hash(this.transactionPin, salt);
+  this.isPinSet = true;
 });
 
-// Helper to verify PIN
 accountSchema.methods.compareTransactionPin = async function (enteredPin) {
-  if (!this.transactionPin) {
-    throw new Error(
-      "Transaction PIN not initialized. Please set one in settings.",
-    );
-  }
+  if (!this.transactionPin) return false;
   return await bcrypt.compare(enteredPin, this.transactionPin);
 };
 

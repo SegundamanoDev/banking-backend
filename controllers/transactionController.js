@@ -18,78 +18,94 @@ exports.transferMoney = async (req, res) => {
 
   const senderUserId = req.user._id;
 
-  // 1. Basic Validation
-  if (!amount || amount <= 0)
+  // 1. Pre-Transaction Validation
+  const transferAmount = Number(amount);
+  if (!transferAmount || transferAmount <= 0) {
     return res
       .status(400)
       .json({ message: "Invalid transaction amount specified." });
-  if (!pin)
+  }
+  if (!pin) {
     return res.status(400).json({
       message: "Security authorization (PIN) is required to proceed.",
     });
+  }
 
   const session = await mongoose.startSession();
   session.startTransaction();
 
   try {
-    // 2. Verify Sender Account
+    // 2. Identify & Secure Source Account
     const senderAccount = await Account.findOne({ user: senderUserId }).session(
       session,
     );
     if (!senderAccount)
       throw new Error("Source account could not be identified.");
 
-    // 3. Verify PIN
-    const isPinValid = await senderAccount.compareTransactionPin(pin);
-    if (!isPinValid)
-      throw new Error("Security checksum mismatch. Invalid Authorization PIN.");
+    // 3. HARD SECURITY CHECK: Account Lock Status
+    if (!senderAccount.isActive) {
+      throw new Error(
+        "Instruction Declined: This account is under a security lock due to multiple failed PIN attempts. Contact Treasury Support.",
+      );
+    }
 
-    // 4. Check Liquidity
-    if (senderAccount.balance < amount)
-      throw new Error("Transaction declined: Insufficient account liquidity.");
+    // 4. CRYPTOGRAPHIC PIN VERIFICATION
+    const isPinValid = await senderAccount.compareTransactionPin(pin);
+    if (!isPinValid) {
+      throw new Error(
+        "Security checksum mismatch. Unauthorized Transaction PIN.",
+      );
+    }
+
+    // 5. LIQUIDITY CHECK
+    if (senderAccount.balance < transferAmount) {
+      throw new Error(
+        "Liquidity Error: Insufficient funds to clear this settlement.",
+      );
+    }
 
     let receiverUserId = null;
     let transactionStatus = "completed";
+    let finalRecipientName = recipientName;
+    let finalBankName = bankName;
 
-    // --- LOGIC BRANCHING ---
     if (category === "local") {
       const receiverAccount = await Account.findOne({
         accountNumber: recipientAccountNumber,
       }).session(session);
 
-      if (!receiverAccount)
+      if (!receiverAccount) {
         throw new Error(
-          "Recipient account validation failed. Beneficiary not found within our records.",
+          "Beneficiary Validation Failed: Account number not recognized within our internal ledger.",
         );
+      }
 
-      if (receiverAccount.accountNumber === senderAccount.accountNumber)
+      if (receiverAccount.accountNumber === senderAccount.accountNumber) {
         throw new Error(
-          "Instruction declined: Source and destination accounts cannot be identical.",
+          "Instruction Declined: Circular remittance (self-transfer) is not permitted via this route.",
         );
+      }
 
-      // Credit internal receiver
-      receiverAccount.balance += Number(amount);
+      receiverAccount.balance += transferAmount;
       await receiverAccount.save({ session });
-      receiverUserId = receiverAccount.user;
-    } else if (category === "international") {
-      if (!swiftCode || !bankName)
-        throw new Error(
-          "Missing Wire Requirements: SWIFT/BIC and Bank Name are mandatory for cross-border settlement.",
-        );
 
-      // International transfers move to 'pending' for Treasury Audit
+      receiverUserId = receiverAccount.user;
+      finalBankName = "United Capital Bank";
+    } else if (category === "international") {
+      if (!swiftCode || !bankName) {
+        throw new Error(
+          "Compliance Error: SWIFT/BIC and Bank Name are mandatory for cross-border wire settlement.",
+        );
+      }
       transactionStatus = "pending";
     } else {
       throw new Error("Unsupported transaction category.");
     }
 
-    // 5. Deduct Sender Balance
-    senderAccount.balance -= Number(amount);
+    senderAccount.balance -= transferAmount;
     await senderAccount.save({ session });
 
-    // 6. Generate Reference & Create Transaction record
     const transactionId = `UC-TXN-${Math.random().toString(36).toUpperCase().substring(2, 10)}`;
-
     const [transaction] = await Transaction.create(
       [
         {
@@ -98,14 +114,13 @@ exports.transferMoney = async (req, res) => {
           receiver: receiverUserId,
           recipientAccountNumber,
           recipientName:
-            recipientName ||
+            finalRecipientName ||
             (category === "local"
               ? "UC INTERNAL CLIENT"
               : "EXTERNAL BENEFICIARY"),
-          recipientBankName:
-            category === "local" ? "United Capital Bank" : bankName,
+          recipientBankName: finalBankName,
           swiftCode: swiftCode || "UCB-INT-CLR",
-          amount,
+          amount: transferAmount,
           type: "transfer",
           category,
           status: transactionStatus,
@@ -117,13 +132,12 @@ exports.transferMoney = async (req, res) => {
       { session },
     );
 
-    // 7. Create In-App Notification
     await Notification.create(
       [
         {
           user: senderUserId,
           title: "Debit Advice Notification",
-          message: `Your account has been debited $${amount.toLocaleString()} for a ${category} remittance to ${recipientAccountNumber}. Reference: ${transactionId}. Status: ${transactionStatus}.`,
+          message: `Account debited $${transferAmount.toLocaleString()} for ${category} remittance to ${recipientAccountNumber}. Ref: ${transactionId}. Status: ${transactionStatus}.`,
           type: "debit",
         },
       ],
@@ -133,25 +147,24 @@ exports.transferMoney = async (req, res) => {
     await session.commitTransaction();
     session.endSession();
 
-    // 8. Final Institutional Response
     return res.status(200).json({
       success: true,
       message:
         category === "international"
-          ? "Wire instruction received. Transaction is currently awaiting Treasury clearance and SWIFT settlement."
-          : "Transaction successful. Funds have been remitted to the beneficiary account.",
+          ? "Wire instruction received and queued for Treasury clearance."
+          : "Transfer finalized. Beneficiary account credited successfully.",
       transactionId: transaction.transactionId,
       availableBalance: senderAccount.balance,
     });
   } catch (error) {
     await session.abortTransaction();
     session.endSession();
-    // Return the specific error message as the reason for instruction failure
+
     return res.status(400).json({
       status: "Instruction Failed",
       message:
         error.message ||
-        "An unexpected error occurred during the settlement process.",
+        "An internal error occurred during the settlement process.",
     });
   }
 };
